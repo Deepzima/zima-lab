@@ -1,0 +1,117 @@
+# zlab observability — full stack
+# VictoriaMetrics + Grafana + Loki + Tempo + OpenTelemetry Collector
+# Full tracing + metrics + logs pipeline
+
+services:
+  victoriametrics:
+    image: victoriametrics/victoria-metrics:v1.103.0
+    container_name: zlab-vm
+    ports:
+      - "${ZLAB_PORT_VM:-8428}:8428"
+    volumes:
+      - vm-data:/storage
+      - ./vmagent-scrape.yml:/etc/vm/scrape.yml:ro
+    command:
+      - "--storageDataPath=/storage"
+      - "--retentionPeriod=14d"
+      - "--httpListenAddr=:8428"
+      - "--promscrape.config=/etc/vm/scrape.yml"
+    depends_on:
+      - cadvisor
+    restart: unless-stopped
+    labels:
+      zlab.component: observability
+      zlab.stack: full
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    container_name: zlab-grafana
+    ports:
+      - "${ZLAB_PORT_GRAFANA:-3000}:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: zlab
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/system-overview.json
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning/datasources/datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml:ro
+      - ./grafana/provisioning/dashboards/dashboards.yaml:/etc/grafana/provisioning/dashboards/dashboards.yaml:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - victoriametrics
+      - loki
+      - tempo
+    restart: unless-stopped
+    labels:
+      zlab.component: observability
+      zlab.stack: full
+
+  loki:
+    image: grafana/loki:3.3.0
+    container_name: zlab-loki
+    ports:
+      - "${ZLAB_PORT_LOKI:-3100}:3100"
+    volumes:
+      - loki-data:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+    restart: unless-stopped
+    labels:
+      zlab.component: observability
+      zlab.stack: full
+
+  tempo:
+    image: grafana/tempo:2.6.1
+    container_name: zlab-tempo
+    ports:
+      - "3200:3200"   # tempo API
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+    volumes:
+      - tempo-data:/var/tempo
+    command: -config.file=/etc/tempo/tempo.yaml
+    restart: unless-stopped
+    labels:
+      zlab.component: observability
+      zlab.stack: full
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.114.0
+    container_name: zlab-otel
+    ports:
+      - "4319:4317"   # OTLP gRPC (shifted to avoid tempo conflict)
+      - "4320:4318"   # OTLP HTTP (shifted)
+      - "8889:8889"   # Prometheus metrics exporter
+    command: --config=/etc/otelcol/config.yaml
+    volumes:
+      - ./otel-config.yaml:/etc/otelcol/config.yaml:ro
+    depends_on:
+      - victoriametrics
+      - loki
+      - tempo
+    restart: unless-stopped
+    labels:
+      zlab.component: observability
+      zlab.stack: full
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: zlab-cadvisor
+    ports:
+      - "${ZLAB_PORT_CADVISOR:-8080}:8080"
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    restart: unless-stopped
+    labels:
+      zlab.component: observability
+      zlab.stack: full
+
+volumes:
+  vm-data:
+  grafana-data:
+  loki-data:
+  tempo-data:

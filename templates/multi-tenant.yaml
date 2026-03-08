@@ -1,0 +1,56 @@
+# zlab multi-tenant template — Kind + VM + compose with full features
+# Usage: zlab init --template multi-tenant
+
+project: multi-env
+tenant: work
+
+assets:
+  - name: k8s-cluster
+    type: kind
+    config:
+      nodes: 3
+      k8s_version: "1.30"
+      cni: cilium
+      addons:
+        - metrics-server
+        - ingress-nginx
+        - local-registry
+      port_mappings:
+        - container: 30080
+          host: 8080
+        - container: 30443
+          host: 8443
+
+  - name: infra
+    type: docker-compose
+    config:
+      compose_file: docker-compose.infra.yml
+
+  - name: dev-vm
+    type: vm
+    config:
+      image: "ubuntu:24.04"
+      cpus: 4
+      memory: "4GiB"
+      disk: "30GiB"
+      vm_type: "qemu"
+      rosetta: true
+      containerd: true
+      ports:
+        - guest: 22
+          host: 2222
+      provision:
+        - mode: system
+          inline: |
+            apt-get update -y
+            apt-get install -y curl git docker.io
+
+network:
+  name: zlab-${project}
+  subnet: "172.30.5.0/24"
+  dns: true
+  peers: []  # add other project network names here
+
+observe:
+  enabled: true
+  stack: full

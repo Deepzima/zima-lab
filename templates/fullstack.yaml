@@ -1,0 +1,25 @@
+# zlab fullstack template — Kind + compose + full observability
+# Usage: zlab init --template fullstack
+
+project: fullstack-dev
+tenant: study
+
+assets:
+  - name: backend
+    driver: compose
+    compose_file: docker-compose.yml
+
+  - name: k8s
+    driver: kind
+    kind_config:
+      nodes:
+        - role: control-plane
+        - role: worker
+        - role: worker
+        - role: worker
+
+network:
+  name: zlab-${project}
+  subnet: "172.30.3.0/24"
+
+observe: full

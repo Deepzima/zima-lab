@@ -1,0 +1,23 @@
+# zlab trading template — trading platform dev environment
+# Usage: zlab init --template trading
+
+project: trading-dev
+tenant: personal
+
+assets:
+  - name: trading-stack
+    driver: compose
+    compose_file: docker-compose.yml
+
+  - name: trading-cluster
+    driver: kind
+    kind_config:
+      nodes:
+        - role: control-plane
+        - role: worker
+
+network:
+  name: zlab-${project}
+  subnet: "172.30.2.0/24"
+
+observe: lightweight

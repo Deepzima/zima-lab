@@ -1,0 +1,33 @@
+# zlab kind-fury template — Kind cluster for Fury distribution testing
+# Usage: zlab init --template kind-fury
+
+project: fury-test
+tenant: work
+
+assets:
+  - name: fury-cluster
+    type: kind
+    config:
+      nodes: 3
+      k8s_version: "1.30"
+      cni: calico              # Fury uses Calico
+      pod_subnet: "10.244.0.0/16"
+      service_subnet: "10.96.0.0/12"
+      addons:
+        - metrics-server
+        - ingress-nginx
+      port_mappings:
+        - container: 80
+          host: 8080
+        - container: 443
+          host: 8443
+      manifests:
+        - manifests/
+
+network:
+  name: zlab-${project}
+  subnet: "172.30.1.0/24"
+
+observe:
+  enabled: true
+  stack: lightweight

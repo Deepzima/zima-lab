@@ -1,0 +1,45 @@
+# zlab network-lab template — advanced networking features
+# Usage: zlab init --template network-lab
+#
+# Demonstrates: macvlan, IPv6, traffic shaping, BIND DNS
+
+project: netlab
+tenant: study
+
+assets:
+  - name: server
+    type: docker-compose
+    config:
+      compose_file: docker-compose.yml
+
+  - name: client
+    type: docker-compose
+    config:
+      compose_file: docker-compose-client.yml
+
+network:
+  name: zlab-${project}
+  driver: bridge             # change to macvlan for LAN-attached containers
+  subnet: "172.30.10.0/24"
+  # driver_opts:              # uncomment for macvlan/ipvlan
+  #   parent: en0
+  #   mode: bridge
+  # gateway: "172.30.10.1"
+  # ip_range: "172.30.10.128/25"
+  mtu: 1500
+  ipv6:
+    enabled: true
+    subnet: "fd00:zlab:10::/64"
+  dns: true
+  dns_engine: bind
+  dns_domain: "netlab.local"
+  shaping:
+    latency: "25ms"
+    jitter: "5ms"
+    loss: "0.5%"
+    # bandwidth: "50mbit"
+    targets: ["client"]       # only shape client traffic
+
+observe:
+  enabled: true
+  stack: lightweight

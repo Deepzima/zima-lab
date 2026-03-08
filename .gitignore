@@ -1,0 +1,19 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# State (generated at runtime)
+.zlab-state/
+
+# User config (installed copy, not tracked)
+config.local.yaml
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Test artifacts
+/test/

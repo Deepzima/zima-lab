@@ -1,0 +1,13 @@
+# Auto-provisioned dashboards for zlab
+apiVersion: 1
+
+providers:
+  - name: zlab
+    orgId: 1
+    folder: zlab
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

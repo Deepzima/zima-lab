@@ -1,0 +1,46 @@
+# zlab global config — your personal defaults
+# These values apply to ALL projects unless overridden in .zlab.yaml
+# Location: ~/.config/infra-lab/config.yaml
+
+defaults:
+  tenant: work
+
+  # VM defaults
+  vm:
+    image: "ubuntu:24.04"     # ubuntu:{24.04,22.04,20.04}, debian:{12,11}, fedora:{41,40},
+                               # alpine:{3.21,3.20}, archlinux, rocky:9, opensuse:tumbleweed,
+                               # or a direct URL/path
+    cpus: 2
+    memory: "2GiB"
+    disk: "10GiB"
+    vm_type: "qemu"           # qemu or vz (macOS Virtualization.framework)
+    rosetta: true              # x86 emulation on Apple Silicon
+    containerd: true           # containerd + nerdctl inside VM
+
+  # Kind cluster defaults
+  kind:
+    k8s_version: "1.30"
+    nodes: 1
+    cni: "default"            # default (kindnet), cilium, calico, flannel
+
+  # Network defaults
+  network:
+    driver: "bridge"           # bridge, macvlan, ipvlan
+    subnet_base: "172.30"     # base for auto-generated subnets
+    # mtu: 1500               # custom MTU (uncomment for jumbo frames etc.)
+    dns: false                 # enable DNS service by default
+    dns_engine: "dnsmasq"     # dnsmasq (lightweight) or bind (ISC BIND9)
+    dns_domain: "zlab.local"  # default domain for DNS resolution
+    # ipv6:                    # dual-stack (uncomment to enable)
+    #   enabled: false
+    #   subnet: "fd00:zlab::/64"
+
+  # Observability defaults
+  observe:
+    enabled: false
+    stack: "lightweight"       # lightweight or full
+    ports:                      # host port overrides (useful when defaults conflict)
+      grafana: 3000
+      victoriametrics: 8428
+      loki: 3100
+      cadvisor: 8080

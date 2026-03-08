@@ -1,0 +1,18 @@
+# Auto-provisioned datasources for zlab lightweight stack (no Tempo)
+apiVersion: 1
+
+datasources:
+  - name: VictoriaMetrics
+    type: prometheus
+    access: proxy
+    url: http://zlab-vm:8428
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: "15s"
+
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://zlab-loki:3100
+    editable: false

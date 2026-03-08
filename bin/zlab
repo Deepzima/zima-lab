@@ -1,0 +1,2138 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ZLAB_VERSION="0.4.0"
+ZLAB_CONFIG_DIR="${ZLAB_CONFIG_DIR:-${HOME}/.config/zlab}"
+ZLAB_GLOBAL_CONFIG="${ZLAB_CONFIG_DIR}/config.yaml"
+ZLAB_STATE_DIR=""
+ZLAB_CONFIG=""
+ZLAB_PROJECT=""
+
+# --- Utilities ---
+
+die()  { echo "zlab: error: $*" >&2; exit 1; }
+info() { echo "zlab: $*"; }
+warn() { echo "zlab: warn: $*" >&2; }
+
+# Read from global config
+gcfg() {
+  if [[ -f "$ZLAB_GLOBAL_CONFIG" ]]; then
+    yq "$1" "$ZLAB_GLOBAL_CONFIG" 2>/dev/null
+  else
+    echo "null"
+  fi
+}
+
+# Read project config → global default → hardcoded fallback
+# Usage: cfg_default '.config.cpus' '.defaults.vm.cpus' '2'
+cfg_default() {
+  local project_expr="$1" global_expr="$2" fallback="$3"
+  local val
+  val=$(cfg "$project_expr")
+  if [[ -n "$val" && "$val" != "null" ]]; then
+    echo "$val"
+    return
+  fi
+  val=$(gcfg "$global_expr")
+  if [[ -n "$val" && "$val" != "null" ]]; then
+    echo "$val"
+    return
+  fi
+  echo "$fallback"
+}
+
+# Same but for asset fields
+# Usage: asset_default idx '.config.cpus' '.defaults.vm.cpus' '2'
+asset_default() {
+  local idx="$1" field="$2" global_expr="$3" fallback="$4"
+  local val
+  val=$(asset "$idx" "$field")
+  if [[ -n "$val" && "$val" != "null" ]]; then
+    echo "$val"
+    return
+  fi
+  val=$(gcfg "$global_expr")
+  if [[ -n "$val" && "$val" != "null" ]]; then
+    echo "$val"
+    return
+  fi
+  echo "$fallback"
+}
+
+# --- VM Image Catalog ---
+
+# Resolve image shorthand to download URL
+# Supports: ubuntu:{24.04,22.04,20.04}, debian:{12,11}, fedora:{41,40},
+#           alpine:{3.21,3.20}, archlinux, rocky:{9}, opensuse:tumbleweed
+#           or a direct URL (http/https) or local path (/)
+resolve_vm_image() {
+  local image="$1"
+  local arch
+  arch=$(uname -m)
+  [[ "$arch" == "arm64" ]] && arch="aarch64"
+
+  case "$image" in
+    ubuntu:24.04|ubuntu:noble|ubuntu)
+      echo "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-${arch}.img" ;;
+    ubuntu:22.04|ubuntu:jammy)
+      echo "https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-${arch}.img" ;;
+    ubuntu:20.04|ubuntu:focal)
+      echo "https://cloud-images.ubuntu.com/releases/20.04/release/ubuntu-20.04-server-cloudimg-${arch}.img" ;;
+    debian:12|debian:bookworm|debian)
+      echo "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-${arch}.qcow2" ;;
+    debian:11|debian:bullseye)
+      echo "https://cloud.debian.org/images/cloud/bullseye/latest/debian-11-generic-${arch}.qcow2" ;;
+    fedora:41|fedora)
+      echo "https://download.fedoraproject.org/pub/fedora/linux/releases/41/Cloud/${arch}/images/Fedora-Cloud-Base-Generic-41-1.4.${arch}.qcow2" ;;
+    fedora:40)
+      echo "https://download.fedoraproject.org/pub/fedora/linux/releases/40/Cloud/${arch}/images/Fedora-Cloud-Base-Generic.${arch}-40-1.14.qcow2" ;;
+    alpine:3.21|alpine)
+      echo "https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/cloud/nocloud_alpine-3.21.0-${arch}.qcow2" ;;
+    alpine:3.20)
+      echo "https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/cloud/nocloud_alpine-3.20.0-${arch}.qcow2" ;;
+    archlinux|arch)
+      echo "https://geo.mirror.pkgbuild.com/images/latest/Arch-Linux-${arch}-cloudimg.qcow2" ;;
+    rocky:9|rocky)
+      echo "https://download.rockylinux.org/pub/rocky/9/images/${arch}/Rocky-9-GenericCloud-Base.latest.${arch}.qcow2" ;;
+    opensuse:tumbleweed|opensuse)
+      echo "https://download.opensuse.org/tumbleweed/appliances/openSUSE-Tumbleweed-Minimal-VM.${arch}-Cloud.qcow2" ;;
+    http://*|https://*|/*)
+      echo "$image" ;;
+    *)
+      warn "unknown image '$image', falling back to ubuntu:24.04"
+      echo "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-${arch}.img" ;;
+  esac
+}
+
+# Find .zlab.yaml walking up from cwd or use --project path
+find_config() {
+  if [[ -n "${ZLAB_PROJECT_PATH:-}" ]]; then
+    ZLAB_CONFIG="$ZLAB_PROJECT_PATH/.zlab.yaml"
+    [[ -f "$ZLAB_CONFIG" ]] || die "no .zlab.yaml found at $ZLAB_PROJECT_PATH"
+    ZLAB_STATE_DIR="$ZLAB_PROJECT_PATH/.zlab"
+    return 0
+  fi
+
+  local dir="$PWD"
+  while [[ "$dir" != "/" ]]; do
+    if [[ -f "$dir/.zlab.yaml" ]]; then
+      ZLAB_CONFIG="$dir/.zlab.yaml"
+      ZLAB_STATE_DIR="$dir/.zlab"
+      return 0
+    fi
+    dir="$(dirname "$dir")"
+  done
+  die "no .zlab.yaml found (run 'zlab init' to create one)"
+}
+
+load_config() {
+  find_config
+  ZLAB_PROJECT=$(yq '.project' "$ZLAB_CONFIG")
+  mkdir -p "$ZLAB_STATE_DIR"
+}
+
+# Read a field from config
+cfg() { yq "$1" "$ZLAB_CONFIG"; }
+
+# Read asset count
+asset_count() { yq '.assets | length' "$ZLAB_CONFIG"; }
+
+# Read asset field
+asset() { yq ".assets[$1].$2" "$ZLAB_CONFIG"; }
+
+# --- Asset Drivers ---
+
+kind_up() {
+  local idx="$1"
+  local name
+  name=$(asset "$idx" "name")
+
+  local nodes k8s_version cni
+  nodes=$(asset_default "$idx" "config.nodes" ".defaults.kind.nodes" "1")
+  k8s_version=$(asset_default "$idx" "config.k8s_version" ".defaults.kind.k8s_version" "1.30")
+  cni=$(asset_default "$idx" "config.cni" ".defaults.kind.cni" "default")
+
+  if kind get clusters 2>/dev/null | grep -q "^${name}$"; then
+    info "kind cluster '$name' already running"
+    return 0
+  fi
+
+  info "creating kind cluster '$name' (nodes=$nodes, k8s=$k8s_version, cni=$cni)..."
+
+  # Generate kind config
+  local kind_config="$ZLAB_STATE_DIR/kind-${name}.yaml"
+  cat > "$kind_config" <<EOF
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+EOF
+
+  # Disable default CNI if using external CNI
+  if [[ "$cni" != "default" ]]; then
+    cat >> "$kind_config" <<EOF
+networking:
+  disableDefaultCNI: true
+  podSubnet: "10.244.0.0/16"
+EOF
+  fi
+
+  # Pod/service subnet overrides
+  local pod_subnet svc_subnet
+  pod_subnet=$(asset "$idx" 'config.pod_subnet // ""')
+  svc_subnet=$(asset "$idx" 'config.service_subnet // ""')
+  if [[ -n "$pod_subnet" && "$pod_subnet" != "null" ]] || [[ -n "$svc_subnet" && "$svc_subnet" != "null" ]]; then
+    # Only add networking block if not already present (from CNI)
+    if [[ "$cni" == "default" ]]; then
+      echo "networking:" >> "$kind_config"
+    fi
+    [[ -n "$pod_subnet" && "$pod_subnet" != "null" ]] && \
+      yq -i ".networking.podSubnet = \"$pod_subnet\"" "$kind_config"
+    [[ -n "$svc_subnet" && "$svc_subnet" != "null" ]] && \
+      yq -i ".networking.serviceSubnet = \"$svc_subnet\"" "$kind_config"
+  fi
+
+  # Feature gates
+  local fg_count
+  fg_count=$(asset "$idx" 'config.feature_gates | length // 0')
+  if [[ "$fg_count" -gt 0 ]]; then
+    local fg
+    for (( fg=0; fg<fg_count; fg++ )); do
+      local gate_name gate_val
+      gate_name=$(asset "$idx" "config.feature_gates[$fg].name")
+      gate_val=$(asset "$idx" "config.feature_gates[$fg].enabled // true")
+      yq -i ".featureGates.\"$gate_name\" = $gate_val" "$kind_config"
+    done
+  fi
+
+  # Nodes
+  echo "nodes:" >> "$kind_config"
+  echo "  - role: control-plane" >> "$kind_config"
+
+  # Control plane labels
+  local cp_label_count
+  cp_label_count=$(asset "$idx" 'config.control_plane_labels | length // 0')
+  if [[ "$cp_label_count" -gt 0 ]]; then
+    echo "    kubeadmConfigPatches:" >> "$kind_config"
+    echo '    - |' >> "$kind_config"
+    echo '      kind: InitConfiguration' >> "$kind_config"
+    echo '      nodeRegistration:' >> "$kind_config"
+    echo '        kubeletExtraArgs:' >> "$kind_config"
+    echo '          node-labels: "ingress-ready=true"' >> "$kind_config"
+  fi
+
+  # Add worker nodes
+  local i
+  for (( i=1; i<nodes; i++ )); do
+    echo "  - role: worker" >> "$kind_config"
+  done
+
+  # Add port mappings if defined
+  local port_count
+  port_count=$(asset "$idx" 'config.port_mappings | length // 0')
+  if [[ "$port_count" -gt 0 ]]; then
+    local tmp
+    tmp=$(mktemp)
+    yq eval '
+      .nodes[0].extraPortMappings = []
+    ' "$kind_config" > "$tmp" && mv "$tmp" "$kind_config"
+
+    local p
+    for (( p=0; p<port_count; p++ )); do
+      local container_port host_port protocol
+      container_port=$(asset "$idx" "config.port_mappings[$p].container")
+      host_port=$(asset "$idx" "config.port_mappings[$p].host")
+      protocol=$(asset "$idx" "config.port_mappings[$p].protocol // \"TCP\"")
+      tmp=$(mktemp)
+      yq eval "
+        .nodes[0].extraPortMappings += [{\"containerPort\": $container_port, \"hostPort\": $host_port, \"protocol\": \"$protocol\"}]
+      " "$kind_config" > "$tmp" && mv "$tmp" "$kind_config"
+    done
+  fi
+
+  kind create cluster \
+    --name "$name" \
+    --image "kindest/node:v${k8s_version}" \
+    --config "$kind_config" \
+    --wait 60s
+
+  # Install CNI
+  case "$cni" in
+    cilium)
+      info "installing Cilium CNI..."
+      if command -v cilium &>/dev/null; then
+        cilium install --context "kind-${name}" --wait=false 2>/dev/null || warn "cilium install failed"
+      else
+        kubectl --context "kind-${name}" apply -f \
+          "https://raw.githubusercontent.com/cilium/cilium/v1.16.5/install/kubernetes/quick-install.yaml" 2>/dev/null \
+          || warn "cilium manifest apply failed"
+      fi
+      ;;
+    calico)
+      info "installing Calico CNI..."
+      kubectl --context "kind-${name}" apply -f \
+        "https://raw.githubusercontent.com/projectcalico/calico/v3.29.1/manifests/calico.yaml" 2>/dev/null \
+        || warn "calico install failed"
+      ;;
+    flannel)
+      info "installing Flannel CNI..."
+      kubectl --context "kind-${name}" apply -f \
+        "https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml" 2>/dev/null \
+        || warn "flannel install failed"
+      ;;
+    default) ;; # kind's default kindnet
+    *)
+      warn "unknown CNI '$cni', cluster may not have networking"
+      ;;
+  esac
+
+  # Install addons
+  local addon_count
+  addon_count=$(asset "$idx" 'config.addons | length // 0')
+  if [[ "$addon_count" -gt 0 ]]; then
+    local a
+    for (( a=0; a<addon_count; a++ )); do
+      local addon
+      addon=$(asset "$idx" "config.addons[$a]")
+      _kind_install_addon "$name" "$addon"
+    done
+  fi
+
+  # Apply manifests if defined
+  local manifests_count
+  manifests_count=$(asset "$idx" 'config.manifests | length // 0')
+  if [[ "$manifests_count" -gt 0 ]]; then
+    local m
+    for (( m=0; m<manifests_count; m++ )); do
+      local manifests_dir
+      manifests_dir=$(asset "$idx" "config.manifests[$m]")
+      if [[ -n "$manifests_dir" && "$manifests_dir" != "null" ]]; then
+        local base_dir
+        base_dir=$(dirname "$ZLAB_CONFIG")
+        if [[ -d "$base_dir/$manifests_dir" ]]; then
+          info "applying manifests from $manifests_dir..."
+          kubectl --context "kind-${name}" apply -R -f "$base_dir/$manifests_dir" || warn "some manifests failed to apply"
+        elif [[ -f "$base_dir/$manifests_dir" ]]; then
+          info "applying manifest $manifests_dir..."
+          kubectl --context "kind-${name}" apply -f "$base_dir/$manifests_dir" || warn "manifest failed to apply"
+        fi
+      fi
+    done
+  fi
+
+  info "kind cluster '$name' ready (context: kind-${name})"
+}
+
+# Install a Kind addon by name
+_kind_install_addon() {
+  local cluster="$1" addon="$2"
+  info "installing addon '$addon'..."
+  case "$addon" in
+    metrics-server)
+      kubectl --context "kind-${cluster}" apply -f \
+        "https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml" 2>/dev/null
+      # Patch for kind (no TLS verification needed for local)
+      kubectl --context "kind-${cluster}" patch deployment metrics-server -n kube-system \
+        --type=json -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]' 2>/dev/null
+      ;;
+    ingress-nginx)
+      kubectl --context "kind-${cluster}" apply -f \
+        "https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml" 2>/dev/null
+      ;;
+    local-registry)
+      _kind_setup_registry "$cluster"
+      ;;
+    cert-manager)
+      kubectl --context "kind-${cluster}" apply -f \
+        "https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml" 2>/dev/null
+      ;;
+    *)
+      warn "unknown addon '$addon'"
+      ;;
+  esac
+}
+
+# Setup local Docker registry connected to Kind
+_kind_setup_registry() {
+  local cluster="$1"
+  local reg_name="zlab-registry"
+  local reg_port="5001"
+
+  if ! docker ps --format '{{.Names}}' | grep -q "^${reg_name}$"; then
+    docker run -d --restart=always -p "127.0.0.1:${reg_port}:5000" --network bridge --name "$reg_name" registry:2
+  fi
+  # Connect to kind network
+  docker network connect "kind" "$reg_name" 2>/dev/null || true
+  # Document the registry
+  cat <<REGEOF | kubectl --context "kind-${cluster}" apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: local-registry-hosting
+  namespace: kube-public
+data:
+  localRegistryHosting.v1: |
+    host: "localhost:${reg_port}"
+    help: "https://kind.sigs.k8s.io/docs/user/local-registry/"
+REGEOF
+  info "local registry at localhost:${reg_port}"
+}
+
+kind_down() {
+  local idx="$1"
+  local name
+  name=$(asset "$idx" "name")
+
+  if kind get clusters 2>/dev/null | grep -q "^${name}$"; then
+    info "deleting kind cluster '$name'..."
+    kind delete cluster --name "$name"
+  else
+    info "kind cluster '$name' not found, skipping"
+  fi
+}
+
+kind_status() {
+  local idx="$1"
+  local name
+  name=$(asset "$idx" "name")
+
+  if kind get clusters 2>/dev/null | grep -q "^${name}$"; then
+    local node_count
+    node_count=$(kubectl --context "kind-${name}" get nodes --no-headers 2>/dev/null | wc -l | tr -d ' ')
+    echo "  kind/$name: running ($node_count nodes)"
+  else
+    echo "  kind/$name: stopped"
+  fi
+}
+
+compose_up() {
+  local idx="$1"
+  local name
+  name=$(asset "$idx" "name")
+  local compose_file
+  compose_file=$(asset "$idx" "config.compose_file")
+
+  local base_dir
+  base_dir=$(dirname "$ZLAB_CONFIG")
+  local full_path="$base_dir/$compose_file"
+
+  [[ -f "$full_path" ]] || die "compose file not found: $full_path"
+
+  info "starting docker-compose services '$name'..."
+  docker compose -f "$full_path" -p "zlab-${ZLAB_PROJECT}-${name}" up -d
+  info "docker-compose '$name' ready"
+}
+
+compose_down() {
+  local idx="$1"
+  local name
+  name=$(asset "$idx" "name")
+  local compose_file
+  compose_file=$(asset "$idx" "config.compose_file")
+
+  local base_dir
+  base_dir=$(dirname "$ZLAB_CONFIG")
+  local full_path="$base_dir/$compose_file"
+
+  if [[ -f "$full_path" ]]; then
+    info "stopping docker-compose services '$name'..."
+    docker compose -f "$full_path" -p "zlab-${ZLAB_PROJECT}-${name}" down
+  fi
+}
+
+compose_status() {
+  local idx="$1"
+  local name
+  name=$(asset "$idx" "name")
+  local compose_file
+  compose_file=$(asset "$idx" "config.compose_file")
+
+  local base_dir
+  base_dir=$(dirname "$ZLAB_CONFIG")
+  local full_path="$base_dir/$compose_file"
+
+  if [[ -f "$full_path" ]]; then
+    local running
+    running=$(docker compose -f "$full_path" -p "zlab-${ZLAB_PROJECT}-${name}" ps --format json 2>/dev/null | jq -r '.State' 2>/dev/null | grep -c "running" || echo "0")
+    local total
+    total=$(docker compose -f "$full_path" -p "zlab-${ZLAB_PROJECT}-${name}" ps --format json 2>/dev/null | jq -r '.State' 2>/dev/null | wc -l | tr -d ' ')
+    echo "  compose/$name: $running/$total running"
+  else
+    echo "  compose/$name: no compose file"
+  fi
+}
+
+# --- VM Driver (Lima) ---
+
+lima_up() {
+  local idx="$1"
+  local name
+  name=$(asset "$idx" "name")
+  local vm_name="zlab-${ZLAB_PROJECT}-${name}"
+
+  if limactl list --json 2>/dev/null | jq -e ".[] | select(.name == \"$vm_name\" and .status == \"Running\")" &>/dev/null; then
+    info "vm '$name' already running"
+    return 0
+  fi
+
+  # Check if VM exists but stopped
+  if limactl list --json 2>/dev/null | jq -e ".[] | select(.name == \"$vm_name\")" &>/dev/null; then
+    info "starting existing vm '$name'..."
+    limactl start "$vm_name"
+    return 0
+  fi
+
+  # Read config with global defaults
+  local image cpus memory disk
+  image=$(asset_default "$idx" "config.image" ".defaults.vm.image" "ubuntu:24.04")
+  cpus=$(asset_default "$idx" "config.cpus" ".defaults.vm.cpus" "2")
+  memory=$(asset_default "$idx" "config.memory" ".defaults.vm.memory" "2GiB")
+  disk=$(asset_default "$idx" "config.disk" ".defaults.vm.disk" "10GiB")
+
+  # Boot options
+  local vm_type rosetta_enabled containerd_system
+  vm_type=$(asset_default "$idx" "config.vm_type" ".defaults.vm.vm_type" "qemu")
+  rosetta_enabled=$(asset_default "$idx" "config.rosetta" ".defaults.vm.rosetta" "true")
+  containerd_system=$(asset_default "$idx" "config.containerd" ".defaults.vm.containerd" "true")
+
+  info "creating vm '$name' (image=$image, cpus=$cpus, mem=$memory, disk=$disk, type=$vm_type)..."
+
+  # Resolve image shorthand to URL
+  local image_url
+  image_url=$(resolve_vm_image "$image")
+  local arch
+  arch=$(uname -m)
+  [[ "$arch" == "arm64" ]] && arch="aarch64"
+
+  # Generate Lima config
+  local lima_config="$ZLAB_STATE_DIR/lima-${name}.yaml"
+  cat > "$lima_config" <<LIMAEOF
+# zlab-generated Lima VM config — $image
+vmType: "${vm_type}"
+
+images:
+  - location: "${image_url}"
+    arch: "${arch}"
+
+cpus: ${cpus}
+memory: "${memory}"
+disk: "${disk}"
+
+LIMAEOF
+
+  # Mounts — project dir r/w, home r/o, plus custom mounts
+  cat >> "$lima_config" <<MOUNTEOF
+mounts:
+  - location: "$(dirname "$ZLAB_CONFIG")"
+    writable: true
+  - location: "~"
+    writable: false
+MOUNTEOF
+
+  local mount_count
+  mount_count=$(asset "$idx" 'config.mounts | length // 0')
+  if [[ "$mount_count" -gt 0 ]]; then
+    local mt
+    for (( mt=0; mt<mount_count; mt++ )); do
+      local mt_location mt_writable
+      mt_location=$(asset "$idx" "config.mounts[$mt].location")
+      mt_writable=$(asset "$idx" "config.mounts[$mt].writable // false")
+      echo "  - location: \"${mt_location}\"" >> "$lima_config"
+      echo "    writable: ${mt_writable}" >> "$lima_config"
+    done
+  fi
+
+  # Rosetta (Apple Silicon x86 emulation)
+  cat >> "$lima_config" <<ROSEOF
+
+rosetta:
+  enabled: ${rosetta_enabled}
+  binfmt: ${rosetta_enabled}
+ROSEOF
+
+  # Containerd
+  cat >> "$lima_config" <<CTDEOF
+
+containerd:
+  system: ${containerd_system}
+  user: false
+CTDEOF
+
+  # Network config inside VM
+  local vm_network
+  vm_network=$(asset "$idx" 'config.network // ""')
+  if [[ -n "$vm_network" && "$vm_network" != "null" ]]; then
+    echo "" >> "$lima_config"
+    echo "networks:" >> "$lima_config"
+    echo "  - lima: $vm_network" >> "$lima_config"
+  fi
+
+  # DNS config
+  local vm_dns
+  vm_dns=$(asset "$idx" 'config.dns | length // 0')
+  if [[ "$vm_dns" -gt 0 ]]; then
+    echo "" >> "$lima_config"
+    echo "dns:" >> "$lima_config"
+    local d
+    for (( d=0; d<vm_dns; d++ )); do
+      local dns_server
+      dns_server=$(asset "$idx" "config.dns[$d]")
+      echo "  - $dns_server" >> "$lima_config"
+    done
+  fi
+
+  # Environment variables
+  local env_count
+  env_count=$(asset "$idx" 'config.env | length // 0')
+  if [[ "$env_count" -gt 0 ]]; then
+    echo "" >> "$lima_config"
+    echo "env:" >> "$lima_config"
+    local e
+    for (( e=0; e<env_count; e++ )); do
+      local env_key env_val
+      env_key=$(asset "$idx" "config.env[$e] | keys | .[0]")
+      env_val=$(asset "$idx" "config.env[$e].$env_key")
+      echo "  $env_key: \"$env_val\"" >> "$lima_config"
+    done
+  fi
+
+  # Port forwarding
+  echo "" >> "$lima_config"
+  echo "portForwards:" >> "$lima_config"
+  local port_count
+  port_count=$(asset "$idx" 'config.ports | length // 0')
+  if [[ "$port_count" -gt 0 ]]; then
+    local p
+    for (( p=0; p<port_count; p++ )); do
+      local guest_port host_port proto
+      guest_port=$(asset "$idx" "config.ports[$p].guest")
+      host_port=$(asset "$idx" "config.ports[$p].host")
+      proto=$(asset "$idx" "config.ports[$p].proto // \"tcp\"")
+      echo "  - guestPort: ${guest_port}" >> "$lima_config"
+      echo "    hostPort: ${host_port}" >> "$lima_config"
+      echo "    proto: ${proto}" >> "$lima_config"
+    done
+  else
+    echo "  - guestPort: 22" >> "$lima_config"
+  fi
+
+  # Provisioning scripts
+  local provision_count
+  provision_count=$(asset "$idx" 'config.provision | length // 0')
+  if [[ "$provision_count" -gt 0 ]]; then
+    echo "" >> "$lima_config"
+    echo "provision:" >> "$lima_config"
+    local s
+    for (( s=0; s<provision_count; s++ )); do
+      local mode script_path inline
+      mode=$(asset "$idx" "config.provision[$s].mode // \"system\"")
+
+      # Inline script support
+      inline=$(asset "$idx" "config.provision[$s].inline // \"\"")
+      if [[ -n "$inline" && "$inline" != "null" ]]; then
+        echo "  - mode: $mode" >> "$lima_config"
+        echo "    script: |" >> "$lima_config"
+        echo "$inline" | sed 's/^/      /' >> "$lima_config"
+        continue
+      fi
+
+      # File-based script
+      script_path=$(asset "$idx" "config.provision[$s].script // \"\"")
+      if [[ -n "$script_path" && "$script_path" != "null" ]]; then
+        local base_dir
+        base_dir=$(dirname "$ZLAB_CONFIG")
+        if [[ -f "$base_dir/$script_path" ]]; then
+          echo "  - mode: $mode" >> "$lima_config"
+          echo "    script: |" >> "$lima_config"
+          sed 's/^/      /' "$base_dir/$script_path" >> "$lima_config"
+        fi
+      fi
+    done
+  fi
+
+  limactl create --name "$vm_name" "$lima_config" --tty=false
+  limactl start "$vm_name"
+
+  info "vm '$name' ready (shell: limactl shell $vm_name)"
+}
+
+lima_down() {
+  local idx="$1"
+  local name
+  name=$(asset "$idx" "name")
+  local vm_name="zlab-${ZLAB_PROJECT}-${name}"
+
+  if limactl list --json 2>/dev/null | jq -e ".[] | select(.name == \"$vm_name\")" &>/dev/null; then
+    info "stopping vm '$name'..."
+    limactl stop "$vm_name" 2>/dev/null || true
+  else
+    info "vm '$name' not found, skipping"
+  fi
+}
+
+lima_destroy() {
+  local idx="$1"
+  local name
+  name=$(asset "$idx" "name")
+  local vm_name="zlab-${ZLAB_PROJECT}-${name}"
+
+  if limactl list --json 2>/dev/null | jq -e ".[] | select(.name == \"$vm_name\")" &>/dev/null; then
+    info "destroying vm '$name'..."
+    limactl stop "$vm_name" 2>/dev/null || true
+    limactl delete "$vm_name" --force
+  fi
+}
+
+lima_status() {
+  local idx="$1"
+  local name
+  name=$(asset "$idx" "name")
+  local vm_name="zlab-${ZLAB_PROJECT}-${name}"
+
+  local status
+  status=$(limactl list --json 2>/dev/null | jq -r ".[] | select(.name == \"$vm_name\") | .status" 2>/dev/null || echo "not found")
+
+  if [[ "$status" == "Running" ]]; then
+    local cpu mem
+    cpu=$(limactl list --json 2>/dev/null | jq -r ".[] | select(.name == \"$vm_name\") | .cpus" 2>/dev/null)
+    mem=$(limactl list --json 2>/dev/null | jq -r ".[] | select(.name == \"$vm_name\") | .memory" 2>/dev/null)
+    local mem_gb=$(( mem / 1073741824 ))
+    echo "  vm/$name: running (${cpu}cpu, ${mem_gb}G)"
+  elif [[ "$status" == "Stopped" ]]; then
+    echo "  vm/$name: stopped"
+  else
+    echo "  vm/$name: not created"
+  fi
+}
+
+lima_ssh() {
+  local idx="$1"
+  local name
+  name=$(asset "$idx" "name")
+  local vm_name="zlab-${ZLAB_PROJECT}-${name}"
+  limactl shell "$vm_name"
+}
+
+lima_logs() {
+  local idx="$1"
+  local name
+  name=$(asset "$idx" "name")
+  local vm_name="zlab-${ZLAB_PROJECT}-${name}"
+
+  local log_file="${HOME}/.lima/${vm_name}/serial.log"
+  if [[ -f "$log_file" ]]; then
+    tail -f -n 50 "$log_file"
+  else
+    warn "no logs found for vm '$name'"
+  fi
+}
+
+# --- DNS Engines ---
+
+# Lightweight DNS via dnsmasq
+_dns_up_dnsmasq() {
+  local dns_name="$1" net_name="$2" dns_domain="$3"
+  info "starting DNS bridge — dnsmasq ($dns_name, domain=$dns_domain)..."
+
+  # Custom forwarders from config
+  local fwd_args=""
+  local fwd_count
+  fwd_count=$(cfg '.network.dns_forwarders | length // 0')
+  if [[ "$fwd_count" -gt 0 ]]; then
+    local f
+    for (( f=0; f<fwd_count; f++ )); do
+      local fwd
+      fwd=$(cfg ".network.dns_forwarders[$f]")
+      fwd_args="$fwd_args --server $fwd"
+    done
+  else
+    fwd_args="--server 8.8.8.8 --server 1.1.1.1"
+  fi
+
+  docker run -d \
+    --name "$dns_name" \
+    --network "$net_name" \
+    --restart unless-stopped \
+    --label "zlab.project=${ZLAB_PROJECT}" \
+    --label "zlab.component=dns" \
+    --label "zlab.dns_engine=dnsmasq" \
+    --cap-add NET_ADMIN \
+    jpillora/dnsmasq \
+    --no-resolv \
+    $fwd_args \
+    --log-queries \
+    --domain="$dns_domain" 2>/dev/null || warn "dnsmasq failed to start"
+}
+
+# Full-featured DNS via ISC BIND9
+_dns_up_bind() {
+  local dns_name="$1" net_name="$2" dns_domain="$3" subnet="$4"
+  info "starting DNS server — BIND9 ($dns_name, domain=$dns_domain)..."
+
+  # Prepare BIND config directory
+  local bind_dir="$ZLAB_STATE_DIR/bind"
+  mkdir -p "$bind_dir/zones"
+
+  # Generate reverse zone info from subnet (e.g. 172.30.1.0/24 → 1.30.172)
+  local reverse_zone
+  reverse_zone=$(_subnet_to_reverse "$subnet")
+
+  # Custom forwarders
+  local forwarders="8.8.8.8; 1.1.1.1;"
+  local fwd_count
+  fwd_count=$(cfg '.network.dns_forwarders | length // 0')
+  if [[ "$fwd_count" -gt 0 ]]; then
+    forwarders=""
+    local f
+    for (( f=0; f<fwd_count; f++ )); do
+      local fwd
+      fwd=$(cfg ".network.dns_forwarders[$f]")
+      forwarders="${forwarders}${fwd}; "
+    done
+  fi
+
+  # DNSSEC config
+  local dnssec_enabled
+  dnssec_enabled=$(cfg '.network.dnssec // false')
+  local dnssec_validation="auto"
+  [[ "$dnssec_enabled" == "true" ]] && dnssec_validation="auto" || dnssec_validation="no"
+
+  # Generate named.conf
+  cat > "$bind_dir/named.conf" <<NAMEDEOF
+options {
+    directory "/var/bind";
+    listen-on { any; };
+    listen-on-v6 { any; };
+    allow-query { any; };
+    allow-recursion { any; };
+    recursion yes;
+    forwarders { ${forwarders} };
+    dnssec-validation ${dnssec_validation};
+    querylog yes;
+};
+
+logging {
+    channel default_log {
+        stderr;
+        severity info;
+        print-time yes;
+        print-category yes;
+    };
+    category default { default_log; };
+    category queries { default_log; };
+};
+
+zone "${dns_domain}" IN {
+    type master;
+    file "/etc/bind/zones/db.${dns_domain}";
+    allow-update { none; };
+};
+
+zone "${reverse_zone}.in-addr.arpa" IN {
+    type master;
+    file "/etc/bind/zones/db.reverse";
+    allow-update { none; };
+};
+NAMEDEOF
+
+  # Custom zones from config
+  local zone_count
+  zone_count=$(cfg '.network.dns_zones | length // 0')
+  if [[ "$zone_count" -gt 0 ]]; then
+    local z
+    for (( z=0; z<zone_count; z++ )); do
+      local zone_name zone_type zone_file
+      zone_name=$(cfg ".network.dns_zones[$z].name")
+      zone_type=$(cfg ".network.dns_zones[$z].type // \"master\"")
+      zone_file=$(cfg ".network.dns_zones[$z].file // \"\"")
+
+      if [[ -n "$zone_file" && "$zone_file" != "null" ]]; then
+        local base_dir
+        base_dir=$(dirname "$ZLAB_CONFIG")
+        if [[ -f "$base_dir/$zone_file" ]]; then
+          cp "$base_dir/$zone_file" "$bind_dir/zones/db.${zone_name}"
+        fi
+      fi
+
+      cat >> "$bind_dir/named.conf" <<ZONEEOF
+
+zone "${zone_name}" IN {
+    type ${zone_type};
+    file "/etc/bind/zones/db.${zone_name}";
+    allow-update { none; };
+};
+ZONEEOF
+    done
+  fi
+
+  # Generate forward zone file
+  local serial
+  serial=$(date +%Y%m%d%H)
+  cat > "$bind_dir/zones/db.${dns_domain}" <<FWDEOF
+\$TTL 300
+@   IN  SOA ns1.${dns_domain}. admin.${dns_domain}. (
+        ${serial}   ; serial
+        3600        ; refresh
+        900         ; retry
+        604800      ; expire
+        300 )       ; minimum TTL
+
+    IN  NS  ns1.${dns_domain}.
+ns1 IN  A   ${subnet%.*}.2
+
+; --- zlab auto-generated records ---
+; Assets will be registered here by zlab after startup
+FWDEOF
+
+  # Generate reverse zone file
+  cat > "$bind_dir/zones/db.reverse" <<REVEOF
+\$TTL 300
+@   IN  SOA ns1.${dns_domain}. admin.${dns_domain}. (
+        ${serial}   ; serial
+        3600        ; refresh
+        900         ; retry
+        604800      ; expire
+        300 )       ; minimum TTL
+
+    IN  NS  ns1.${dns_domain}.
+REVEOF
+
+  # Add custom static records from config
+  local record_count
+  record_count=$(cfg '.network.dns_records | length // 0')
+  if [[ "$record_count" -gt 0 ]]; then
+    local r
+    for (( r=0; r<record_count; r++ )); do
+      local rname rtype rvalue
+      rname=$(cfg ".network.dns_records[$r].name")
+      rtype=$(cfg ".network.dns_records[$r].type // \"A\"")
+      rvalue=$(cfg ".network.dns_records[$r].value")
+      echo "${rname}  IN  ${rtype}  ${rvalue}" >> "$bind_dir/zones/db.${dns_domain}"
+    done
+  fi
+
+  # Run BIND9 container
+  docker run -d \
+    --name "$dns_name" \
+    --network "$net_name" \
+    --restart unless-stopped \
+    --label "zlab.project=${ZLAB_PROJECT}" \
+    --label "zlab.component=dns" \
+    --label "zlab.dns_engine=bind" \
+    -v "$bind_dir/named.conf:/etc/bind/named.conf:ro" \
+    -v "$bind_dir/zones:/etc/bind/zones" \
+    internetsystemsconsortium/bind9:9.20 2>/dev/null \
+    || warn "BIND9 failed to start"
+
+  info "BIND9 DNS at domain '$dns_domain'"
+}
+
+# Register asset DNS records in BIND zone after containers are up
+_dns_register_assets() {
+  local dns_engine
+  dns_engine=$(cfg_default '.network.dns_engine' '.defaults.network.dns_engine' 'dnsmasq')
+  [[ "$dns_engine" == "bind" ]] || return 0
+
+  local dns_domain
+  dns_domain=$(cfg_default '.network.dns_domain' '.defaults.network.dns_domain' 'zlab.local')
+  local net_name
+  net_name=$(cfg '.network.name // ""')
+  [[ -n "$net_name" && "$net_name" != "null" ]] || return 0
+
+  local bind_dir="$ZLAB_STATE_DIR/bind"
+  local zone_file="$bind_dir/zones/db.${dns_domain}"
+  [[ -f "$zone_file" ]] || return 0
+
+  # Remove old auto-generated records (everything after the marker)
+  sed -i '' '/^; --- zlab auto-generated/,$d' "$zone_file" 2>/dev/null || true
+  echo "; --- zlab auto-generated records ---" >> "$zone_file"
+
+  # Get all containers on the project network and register them
+  local containers_json
+  containers_json=$(docker network inspect "$net_name" --format '{{json .Containers}}' 2>/dev/null)
+  if [[ -n "$containers_json" && "$containers_json" != "null" ]]; then
+    echo "$containers_json" | jq -r 'to_entries[] | "\(.value.Name) \(.value.IPv4Address)"' 2>/dev/null | while IFS=' ' read -r cname cip; do
+      # Strip /subnet from IP
+      cip="${cip%/*}"
+      # Sanitize container name for DNS (replace non-alphanumeric with -)
+      local dnsname
+      dnsname=$(echo "$cname" | sed 's/[^a-zA-Z0-9-]/-/g')
+      echo "${dnsname}  IN  A  ${cip}" >> "$zone_file"
+    done
+  fi
+
+  # Bump serial and reload BIND
+  local serial
+  serial=$(date +%Y%m%d%H)
+  sed -i '' "s/[0-9]\\{10\\}.*; serial/${serial}   ; serial/" "$zone_file" 2>/dev/null || true
+
+  # Reload BIND config
+  local dns_name="zlab-dns-${ZLAB_PROJECT}"
+  docker exec "$dns_name" rndc reload 2>/dev/null || docker restart "$dns_name" 2>/dev/null || true
+  info "DNS records updated for ${dns_domain}"
+}
+
+# Convert subnet to reverse zone name (172.30.1.0/24 → 1.30.172)
+_subnet_to_reverse() {
+  local subnet="$1"
+  local ip="${subnet%/*}"
+  local IFS='.'
+  read -r o1 o2 o3 o4 <<< "$ip"
+  echo "${o3}.${o2}.${o1}"
+}
+
+# --- Network ---
+
+# Apply traffic shaping (tc/netem) to specific containers
+# Uses a sidecar container with NET_ADMIN to inject tc rules
+_network_apply_shaping() {
+  local shaping_latency shaping_jitter shaping_loss shaping_bw
+  shaping_latency=$(cfg '.network.shaping.latency // null')
+  shaping_jitter=$(cfg '.network.shaping.jitter // null')
+  shaping_loss=$(cfg '.network.shaping.loss // null')
+  shaping_bw=$(cfg '.network.shaping.bandwidth // null')
+
+  # Nothing configured
+  [[ "$shaping_latency" != "null" || "$shaping_loss" != "null" || "$shaping_bw" != "null" ]] || return 0
+
+  local net_name
+  net_name=$(cfg '.network.name // ""')
+  [[ -n "$net_name" && "$net_name" != "null" ]] || return 0
+
+  # Which containers to shape
+  local target_count
+  target_count=$(cfg '.network.shaping.targets | length // 0')
+  local targets=()
+  if [[ "$target_count" -gt 0 ]]; then
+    local t
+    for (( t=0; t<target_count; t++ )); do
+      local tgt
+      tgt=$(cfg ".network.shaping.targets[$t]")
+      # Resolve asset name to container name(s)
+      local count
+      count=$(asset_count)
+      local i
+      for (( i=0; i<count; i++ )); do
+        local aname atype
+        aname=$(asset "$i" "name")
+        atype=$(asset "$i" "type")
+        if [[ "$aname" == "$tgt" ]]; then
+          case "$atype" in
+            docker-compose)
+              local containers
+              containers=$(docker ps --filter "label=zlab.asset=$aname" --format '{{.Names}}' 2>/dev/null)
+              for c in $containers; do targets+=("$c"); done
+              ;;
+            kind)
+              targets+=("${aname}-control-plane")
+              ;;
+          esac
+        fi
+      done
+    done
+  else
+    # Apply to all containers on the network
+    local containers
+    containers=$(docker network inspect "$net_name" --format '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null)
+    for c in $containers; do
+      # Skip DNS and observe containers
+      [[ "$c" == zlab-dns-* || "$c" == zlab-vm || "$c" == zlab-grafana || "$c" == zlab-loki || "$c" == zlab-cadvisor || "$c" == zlab-otel ]] && continue
+      targets+=("$c")
+    done
+  fi
+
+  [[ ${#targets[@]} -gt 0 ]] || return 0
+
+  # Build tc netem command
+  local tc_cmd="tc qdisc replace dev eth0 root netem"
+  [[ "$shaping_latency" != "null" ]] && tc_cmd="$tc_cmd delay $shaping_latency"
+  [[ "$shaping_jitter" != "null" ]] && tc_cmd="$tc_cmd $shaping_jitter"
+  [[ "$shaping_loss" != "null" ]] && tc_cmd="$tc_cmd loss $shaping_loss"
+
+  local tbf_cmd=""
+  if [[ "$shaping_bw" != "null" ]]; then
+    # Convert bandwidth to tbf: rate + burst + latency
+    tbf_cmd="tc qdisc add dev eth0 parent 1:1 handle 10: tbf rate $shaping_bw burst 32kbit latency 50ms"
+  fi
+
+  info "applying traffic shaping to ${#targets[@]} container(s)..."
+  for container in "${targets[@]}"; do
+    # Try exec in container first, fallback to sidecar alpine with iproute2
+    if ! docker exec "$container" sh -c "$tc_cmd" &>/dev/null; then
+      docker run --rm --net=container:"$container" --cap-add NET_ADMIN \
+        alpine sh -c "apk add -q iproute2 2>/dev/null && $tc_cmd" &>/dev/null \
+        || warn "traffic shaping failed for $container (missing NET_ADMIN or iproute2)"
+    fi
+
+    if [[ -n "$tbf_cmd" ]]; then
+      if ! docker exec "$container" sh -c "$tbf_cmd" &>/dev/null; then
+        docker run --rm --net=container:"$container" --cap-add NET_ADMIN \
+          alpine sh -c "apk add -q iproute2 2>/dev/null && $tbf_cmd" &>/dev/null || true
+      fi
+    fi
+
+    local desc=""
+    [[ "$shaping_latency" != "null" ]] && desc="${desc}latency=${shaping_latency} "
+    [[ "$shaping_jitter" != "null" ]] && desc="${desc}jitter=${shaping_jitter} "
+    [[ "$shaping_loss" != "null" ]] && desc="${desc}loss=${shaping_loss} "
+    [[ "$shaping_bw" != "null" ]] && desc="${desc}bw=${shaping_bw}"
+    info "  $container: $desc"
+  done
+}
+
+# Remove traffic shaping from containers
+_network_remove_shaping() {
+  local net_name
+  net_name=$(cfg '.network.name // ""')
+  [[ -n "$net_name" && "$net_name" != "null" ]] || return 0
+
+  local containers
+  containers=$(docker network inspect "$net_name" --format '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null)
+  for c in $containers; do
+    [[ "$c" == zlab-dns-* || "$c" == zlab-vm || "$c" == zlab-grafana || "$c" == zlab-loki || "$c" == zlab-cadvisor || "$c" == zlab-otel ]] && continue
+    if ! docker exec "$c" tc qdisc del dev eth0 root &>/dev/null; then
+      docker run --rm --net=container:"$c" --cap-add NET_ADMIN \
+        alpine sh -c "apk add -q iproute2 2>/dev/null; tc qdisc del dev eth0 root" &>/dev/null || true
+    fi
+  done
+}
+
+network_up() {
+  local net_name
+  net_name=$(cfg '.network.name // ""')
+  [[ -n "$net_name" && "$net_name" != "null" ]] || return 0
+
+  local subnet
+  subnet=$(cfg '.network.subnet // "10.100.0.0/24"')
+
+  if docker network inspect "$net_name" &>/dev/null; then
+    info "network '$net_name' already exists"
+  else
+    # Network driver: bridge (default), macvlan, ipvlan
+    local driver
+    driver=$(cfg '.network.driver // "bridge"')
+    local mtu
+    mtu=$(cfg '.network.mtu // null')
+
+    local create_args=(
+      --driver "$driver"
+      --subnet "$subnet"
+      --label "zlab.project=${ZLAB_PROJECT}"
+    )
+
+    # MTU
+    if [[ -n "$mtu" && "$mtu" != "null" ]]; then
+      create_args+=(--opt "com.docker.network.driver.mtu=$mtu")
+    fi
+
+    # Driver-specific options (parent interface, mode, etc.)
+    local dopt_count
+    dopt_count=$(cfg '.network.driver_opts // {} | keys | length')
+    if [[ "$dopt_count" -gt 0 ]]; then
+      local dkeys
+      dkeys=$(cfg '.network.driver_opts | keys | .[]')
+      while IFS= read -r key; do
+        local val
+        val=$(cfg ".network.driver_opts.${key}")
+        case "$driver" in
+          macvlan)
+            [[ "$key" == "parent" ]] && create_args+=(--opt "parent=$val")
+            [[ "$key" == "mode" ]] && create_args+=(--opt "macvlan_mode=$val")
+            ;;
+          ipvlan)
+            [[ "$key" == "parent" ]] && create_args+=(--opt "parent=$val")
+            [[ "$key" == "mode" ]] && create_args+=(--opt "ipvlan_mode=$val")
+            ;;
+        esac
+      done <<< "$dkeys"
+    fi
+
+    # macvlan/ipvlan gateway
+    if [[ "$driver" == "macvlan" || "$driver" == "ipvlan" ]]; then
+      local gateway
+      gateway=$(cfg '.network.gateway // null')
+      if [[ -n "$gateway" && "$gateway" != "null" ]]; then
+        create_args+=(--gateway "$gateway")
+      fi
+      local ip_range
+      ip_range=$(cfg '.network.ip_range // null')
+      if [[ -n "$ip_range" && "$ip_range" != "null" ]]; then
+        create_args+=(--ip-range "$ip_range")
+      fi
+    fi
+
+    # Dual-stack IPv6
+    local ipv6_enabled
+    ipv6_enabled=$(cfg '.network.ipv6.enabled // false')
+    if [[ "$ipv6_enabled" == "true" ]]; then
+      create_args+=(--ipv6)
+      local ipv6_subnet
+      ipv6_subnet=$(cfg '.network.ipv6.subnet // null')
+      if [[ -n "$ipv6_subnet" && "$ipv6_subnet" != "null" ]]; then
+        create_args+=(--subnet "$ipv6_subnet")
+      fi
+    fi
+
+    info "creating docker network '$net_name' ($driver, $subnet)..."
+    docker network create "${create_args[@]}" "$net_name"
+  fi
+
+  # Traffic shaping (tc/netem) — applied after all assets are connected
+  # Deferred to _network_apply_shaping(), called at end of cmd_up
+
+  # DNS service — dnsmasq (lightweight) or bind (full-featured)
+  local dns_enabled
+  dns_enabled=$(cfg '.network.dns // false')
+  if [[ "$dns_enabled" == "true" ]]; then
+    local dns_engine
+    dns_engine=$(cfg_default '.network.dns_engine' '.defaults.network.dns_engine' 'dnsmasq')
+    local dns_domain
+    dns_domain=$(cfg_default '.network.dns_domain' '.defaults.network.dns_domain' 'zlab.local')
+    local dns_name="zlab-dns-${ZLAB_PROJECT}"
+
+    if ! docker ps --format '{{.Names}}' | grep -q "^${dns_name}$"; then
+      case "$dns_engine" in
+        dnsmasq)
+          _dns_up_dnsmasq "$dns_name" "$net_name" "$dns_domain"
+          ;;
+        bind)
+          _dns_up_bind "$dns_name" "$net_name" "$dns_domain" "$subnet"
+          ;;
+        *)
+          warn "unknown dns_engine '$dns_engine', using dnsmasq"
+          _dns_up_dnsmasq "$dns_name" "$net_name" "$dns_domain"
+          ;;
+      esac
+    fi
+  fi
+
+  # Peer networks — connect this project to other projects' networks
+  local peer_count
+  peer_count=$(cfg '.network.peers | length // 0')
+  if [[ "$peer_count" -gt 0 ]]; then
+    local p
+    for (( p=0; p<peer_count; p++ )); do
+      local peer_net
+      peer_net=$(cfg ".network.peers[$p]")
+      if docker network inspect "$peer_net" &>/dev/null; then
+        info "peering with network '$peer_net'"
+        # Connect all running containers on our network to the peer network
+        _network_peer "$net_name" "$peer_net"
+      else
+        warn "peer network '$peer_net' not found (start that project first)"
+      fi
+    done
+  fi
+}
+
+# Connect containers between two networks (bidirectional peering)
+_network_peer() {
+  local src_net="$1" dst_net="$2"
+
+  # Get containers on source network, connect them to destination
+  local containers
+  containers=$(docker network inspect "$src_net" --format '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null)
+  for c in $containers; do
+    if ! docker inspect "$c" --format '{{json .NetworkSettings.Networks}}' 2>/dev/null | grep -q "\"$dst_net\""; then
+      docker network connect "$dst_net" "$c" 2>/dev/null || true
+    fi
+  done
+}
+
+# Connect a Kind cluster to the project Docker network
+network_connect_kind() {
+  local cluster_name="$1"
+  local net_name
+  net_name=$(cfg '.network.name // ""')
+  [[ -n "$net_name" && "$net_name" != "null" ]] || return 0
+
+  # Kind nodes are Docker containers named <cluster>-control-plane, <cluster>-worker, etc.
+  local nodes
+  nodes=$(docker ps --format '{{.Names}}' | grep "^${cluster_name}-" || true)
+  for node in $nodes; do
+    if ! docker inspect "$node" --format '{{json .NetworkSettings.Networks}}' 2>/dev/null | grep -q "\"$net_name\""; then
+      info "connecting kind node '$node' to network '$net_name'"
+      docker network connect "$net_name" "$node" 2>/dev/null || true
+    fi
+  done
+}
+
+# Connect compose containers to the project Docker network
+network_connect_compose() {
+  local compose_project="$1"
+  local net_name
+  net_name=$(cfg '.network.name // ""')
+  [[ -n "$net_name" && "$net_name" != "null" ]] || return 0
+
+  local containers
+  containers=$(docker ps --filter "label=com.docker.compose.project=${compose_project}" --format '{{.Names}}' 2>/dev/null)
+  for c in $containers; do
+    if ! docker inspect "$c" --format '{{json .NetworkSettings.Networks}}' 2>/dev/null | grep -q "\"$net_name\""; then
+      info "connecting container '$c' to network '$net_name'"
+      docker network connect "$net_name" "$c" 2>/dev/null || true
+    fi
+  done
+}
+
+network_down() {
+  local net_name
+  net_name=$(cfg '.network.name // ""')
+  [[ -n "$net_name" && "$net_name" != "null" ]] || return 0
+
+  # Stop DNS bridge
+  local dns_name="zlab-dns-${ZLAB_PROJECT}"
+  if docker ps -a --format '{{.Names}}' | grep -q "^${dns_name}$"; then
+    docker rm -f "$dns_name" 2>/dev/null || true
+  fi
+
+  if docker network inspect "$net_name" &>/dev/null; then
+    # Disconnect all containers first
+    local containers
+    containers=$(docker network inspect "$net_name" --format '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null)
+    for c in $containers; do
+      docker network disconnect -f "$net_name" "$c" 2>/dev/null || true
+    done
+    info "removing network '$net_name'..."
+    docker network rm "$net_name" 2>/dev/null || warn "network '$net_name' still in use"
+  fi
+}
+
+# Show detailed network topology
+network_topology() {
+  load_config
+  local net_name
+  net_name=$(cfg '.network.name // "none"')
+  local subnet
+  subnet=$(cfg '.network.subnet // "n/a"')
+
+  local driver
+  driver=$(cfg '.network.driver // "bridge"')
+  local mtu
+  mtu=$(cfg '.network.mtu // null')
+
+  echo "╔══════════════════════════════════════════╗"
+  echo "║  zlab network: $ZLAB_PROJECT"
+  echo "╠══════════════════════════════════════════╣"
+  echo "║  network: $net_name"
+  echo "║  driver:  $driver"
+  echo "║  subnet:  $subnet"
+  [[ "$mtu" != "null" && -n "$mtu" ]] && echo "║  mtu:     $mtu"
+
+  # Driver opts
+  if [[ "$driver" == "macvlan" || "$driver" == "ipvlan" ]]; then
+    local parent mode
+    parent=$(cfg '.network.driver_opts.parent // "n/a"')
+    mode=$(cfg '.network.driver_opts.mode // "bridge"')
+    echo "║  parent:  $parent (mode=$mode)"
+  fi
+
+  # IPv6
+  local ipv6_enabled
+  ipv6_enabled=$(cfg '.network.ipv6.enabled // false')
+  if [[ "$ipv6_enabled" == "true" ]]; then
+    local ipv6_subnet
+    ipv6_subnet=$(cfg '.network.ipv6.subnet // "auto"')
+    echo "║  ipv6:    $ipv6_subnet"
+  fi
+
+  # DNS
+  local dns_enabled
+  dns_enabled=$(cfg '.network.dns // false')
+  if [[ "$dns_enabled" == "true" ]]; then
+    local dns_name="zlab-dns-${ZLAB_PROJECT}"
+    local dns_engine
+    dns_engine=$(cfg_default '.network.dns_engine' '.defaults.network.dns_engine' 'dnsmasq')
+    local dns_domain
+    dns_domain=$(cfg_default '.network.dns_domain' '.defaults.network.dns_domain' 'zlab.local')
+    if docker ps --format '{{.Names}}' | grep -q "^${dns_name}$"; then
+      echo "║  dns:     active ($dns_engine, domain=$dns_domain)"
+    else
+      echo "║  dns:     configured ($dns_engine, not running)"
+    fi
+  fi
+
+  # Traffic shaping
+  local sh_latency sh_loss sh_bw
+  sh_latency=$(cfg '.network.shaping.latency // null')
+  sh_loss=$(cfg '.network.shaping.loss // null')
+  sh_bw=$(cfg '.network.shaping.bandwidth // null')
+  if [[ "$sh_latency" != "null" || "$sh_loss" != "null" || "$sh_bw" != "null" ]]; then
+    local sh_desc=""
+    [[ "$sh_latency" != "null" ]] && sh_desc="${sh_desc}latency=${sh_latency} "
+    [[ "$sh_loss" != "null" ]] && sh_desc="${sh_desc}loss=${sh_loss} "
+    [[ "$sh_bw" != "null" ]] && sh_desc="${sh_desc}bw=${sh_bw}"
+    echo "║  shaping: $sh_desc"
+  fi
+
+  echo "╠══════════════════════════════════════════╣"
+
+  # Show connected containers with IPs
+  if [[ "$net_name" != "none" ]] && docker network inspect "$net_name" &>/dev/null; then
+    echo "║  connected assets:"
+    docker network inspect "$net_name" --format '{{range $id, $c := .Containers}}{{printf "║    %-25s %s\n" $c.Name $c.IPv4Address}}{{end}}' 2>/dev/null
+  else
+    echo "║  no active network"
+  fi
+
+  # Peers
+  local peer_count
+  peer_count=$(cfg '.network.peers | length // 0')
+  if [[ "$peer_count" -gt 0 ]]; then
+    echo "╠══════════════════════════════════════════╣"
+    echo "║  peers:"
+    local p
+    for (( p=0; p<peer_count; p++ )); do
+      local peer
+      peer=$(cfg ".network.peers[$p]")
+      if docker network inspect "$peer" &>/dev/null; then
+        echo "║    $peer (active)"
+      else
+        echo "║    $peer (inactive)"
+      fi
+    done
+  fi
+
+  # Port forwards
+  echo "╠══════════════════════════════════════════╣"
+  echo "║  port forwards:"
+  local count
+  count=$(asset_count)
+  local i
+  for (( i=0; i<count; i++ )); do
+    local aname atype
+    aname=$(asset "$i" "name")
+    atype=$(asset "$i" "type")
+    case "$atype" in
+      kind)
+        local pm_count
+        pm_count=$(asset "$i" 'config.port_mappings | length // 0')
+        if [[ "$pm_count" -gt 0 ]]; then
+          local pm
+          for (( pm=0; pm<pm_count; pm++ )); do
+            local hp cp
+            hp=$(asset "$i" "config.port_mappings[$pm].host")
+            cp=$(asset "$i" "config.port_mappings[$pm].container")
+            echo "║    kind/$aname: localhost:$hp → :$cp"
+          done
+        fi
+        ;;
+      vm)
+        local vp_count
+        vp_count=$(asset "$i" 'config.ports | length // 0')
+        if [[ "$vp_count" -gt 0 ]]; then
+          local vp
+          for (( vp=0; vp<vp_count; vp++ )); do
+            local hp gp
+            hp=$(asset "$i" "config.ports[$vp].host")
+            gp=$(asset "$i" "config.ports[$vp].guest")
+            echo "║    vm/$aname: localhost:$hp → :$gp"
+          done
+        fi
+        ;;
+    esac
+  done
+
+  echo "╚══════════════════════════════════════════╝"
+}
+
+# --- Observability ---
+
+_observe_port() {
+  local service="$1" default="$2"
+  local val
+  val=$(cfg ".observe.ports.${service} // null")
+  if [[ -n "$val" && "$val" != "null" ]]; then
+    echo "$val"
+  else
+    echo "$default"
+  fi
+}
+
+# Export env vars for compose port interpolation
+_observe_export_ports() {
+  export ZLAB_PORT_GRAFANA=$(_observe_port "grafana" "3000")
+  export ZLAB_PORT_VM=$(_observe_port "victoriametrics" "8428")
+  export ZLAB_PORT_LOKI=$(_observe_port "loki" "3100")
+  export ZLAB_PORT_CADVISOR=$(_observe_port "cadvisor" "8080")
+}
+
+observe_up() {
+  local enabled
+  enabled=$(cfg '.observe.enabled // false')
+  [[ "$enabled" == "true" ]] || return 0
+
+  local stack
+  stack=$(cfg '.observe.stack // "lightweight"')
+  local stack_file="$ZLAB_CONFIG_DIR/stacks/observe-${stack}.yml"
+
+  if [[ ! -f "$stack_file" ]]; then
+    warn "observability stack '$stack' not found at $stack_file"
+    return 1
+  fi
+
+  _observe_export_ports
+
+  info "starting observability stack ($stack)..."
+  docker compose -f "$stack_file" -p "zlab-${ZLAB_PROJECT}-observe" up -d
+  info "observability ready — Grafana at http://localhost:${ZLAB_PORT_GRAFANA}"
+}
+
+observe_down() {
+  local enabled
+  enabled=$(cfg '.observe.enabled // false')
+  [[ "$enabled" == "true" ]] || return 0
+
+  local stack
+  stack=$(cfg '.observe.stack // "lightweight"')
+  local stack_file="$ZLAB_CONFIG_DIR/stacks/observe-${stack}.yml"
+
+  if [[ -f "$stack_file" ]]; then
+    _observe_export_ports
+
+    info "stopping observability stack..."
+    docker compose -f "$stack_file" -p "zlab-${ZLAB_PROJECT}-observe" down
+  fi
+}
+
+# --- Commands ---
+
+cmd_init() {
+  local template="${1:-basic}"
+  local template_file="$ZLAB_CONFIG_DIR/templates/${template}.yaml"
+
+  if [[ -f ".zlab.yaml" ]]; then
+    die ".zlab.yaml already exists in current directory"
+  fi
+
+  if [[ -f "$template_file" ]]; then
+    cp "$template_file" .zlab.yaml
+    info "created .zlab.yaml from template '$template'"
+  else
+    cat > .zlab.yaml <<'EOF'
+project: my-project
+tenant: personal
+
+network:
+  name: my-project-net
+  subnet: 10.100.1.0/24
+
+assets:
+  - name: app-cluster
+    type: kind
+    config:
+      nodes: 1
+      k8s_version: "1.30"
+
+observe:
+  enabled: false
+  stack: lightweight
+EOF
+    info "created default .zlab.yaml"
+  fi
+  info "edit .zlab.yaml then run 'zlab up'"
+}
+
+cmd_up() {
+  load_config
+  info "bringing up project '$ZLAB_PROJECT'..."
+
+  # Network first
+  network_up
+
+  # Assets
+  local count
+  count=$(asset_count)
+  local i
+  for (( i=0; i<count; i++ )); do
+    local type name
+    type=$(asset "$i" "type")
+    name=$(asset "$i" "name")
+    case "$type" in
+      kind)
+        kind_up "$i"
+        network_connect_kind "$name"
+        ;;
+      docker-compose)
+        compose_up "$i"
+        network_connect_compose "zlab-${ZLAB_PROJECT}-${name}"
+        ;;
+      vm)
+        lima_up "$i"
+        ;;
+      *)
+        warn "unknown asset type: $type (skipping)"
+        ;;
+    esac
+  done
+
+  # Observability
+  observe_up
+  # Connect observe containers to project network too
+  local obs_enabled
+  obs_enabled=$(cfg '.observe.enabled // false')
+  if [[ "$obs_enabled" == "true" ]]; then
+    network_connect_compose "zlab-${ZLAB_PROJECT}-observe"
+  fi
+
+  # Register all assets in BIND DNS (if using bind engine)
+  _dns_register_assets
+
+  # Apply traffic shaping (netem) if configured
+  _network_apply_shaping
+
+  echo ""
+  info "project '$ZLAB_PROJECT' is up"
+  cmd_status
+}
+
+cmd_down() {
+  load_config
+  info "tearing down project '$ZLAB_PROJECT'..."
+
+  # Observability first
+  observe_down
+
+  # Assets in reverse order
+  local count
+  count=$(asset_count)
+  local i
+  for (( i=count-1; i>=0; i-- )); do
+    local type
+    type=$(asset "$i" "type")
+    case "$type" in
+      kind)           kind_down "$i" ;;
+      docker-compose) compose_down "$i" ;;
+      vm)             lima_down "$i" ;;
+      *)              warn "unknown asset type: $type (skipping)" ;;
+    esac
+  done
+
+  # Network last
+  network_down
+
+  # Clean state
+  rm -rf "$ZLAB_STATE_DIR"
+
+  info "project '$ZLAB_PROJECT' is down"
+}
+
+cmd_status() {
+  load_config
+  echo "project: $ZLAB_PROJECT"
+  echo "config:  $ZLAB_CONFIG"
+  echo "assets:"
+
+  local count
+  count=$(asset_count)
+  local i
+  for (( i=0; i<count; i++ )); do
+    local type
+    type=$(asset "$i" "type")
+    case "$type" in
+      kind)           kind_status "$i" ;;
+      docker-compose) compose_status "$i" ;;
+      vm)             lima_status "$i" ;;
+      *)              echo "  $type/$(asset "$i" "name"): unknown type" ;;
+    esac
+  done
+
+  # Network
+  local net_name
+  net_name=$(cfg '.network.name // ""')
+  if [[ -n "$net_name" && "$net_name" != "null" ]]; then
+    if docker network inspect "$net_name" &>/dev/null; then
+      local connected
+      connected=$(docker network inspect "$net_name" --format '{{len .Containers}}' 2>/dev/null)
+      echo "network: $net_name (active, ${connected} endpoints)"
+    else
+      echo "network: $net_name (inactive)"
+    fi
+  fi
+
+  # Observability
+  local obs_enabled
+  obs_enabled=$(cfg '.observe.enabled // false')
+  if [[ "$obs_enabled" == "true" ]]; then
+    local obs_stack
+    obs_stack=$(cfg '.observe.stack // "lightweight"')
+    echo "observe: $obs_stack (enabled)"
+  fi
+}
+
+cmd_ssh() {
+  local target="${1:-}"
+  [[ -n "$target" ]] || die "usage: zlab ssh <asset-name>"
+  load_config
+
+  local count
+  count=$(asset_count)
+  local i
+  for (( i=0; i<count; i++ )); do
+    local name
+    name=$(asset "$i" "name")
+    if [[ "$name" == "$target" ]]; then
+      local type
+      type=$(asset "$i" "type")
+      case "$type" in
+        kind)
+          info "entering kind cluster '$name'..."
+          kubectl --context "kind-${name}" run -it --rm debug --image=alpine -- /bin/sh
+          ;;
+        docker-compose)
+          local compose_file
+          compose_file=$(asset "$i" "config.compose_file")
+          local base_dir
+          base_dir=$(dirname "$ZLAB_CONFIG")
+          info "available services:"
+          docker compose -f "$base_dir/$compose_file" -p "zlab-${ZLAB_PROJECT}-${name}" ps --format "table {{.Name}}\t{{.State}}"
+          echo ""
+          info "use: docker exec -it <container> sh"
+          ;;
+        vm)
+          lima_ssh "$i"
+          ;;
+        *) die "ssh not supported for asset type: $type" ;;
+      esac
+      return 0
+    fi
+  done
+  die "asset '$target' not found"
+}
+
+cmd_observe() {
+  load_config
+  local enabled
+  enabled=$(cfg '.observe.enabled // false')
+  [[ "$enabled" == "true" ]] || die "observability not enabled in .zlab.yaml"
+
+  local gf_port
+  gf_port=$(_observe_port "grafana" "3000")
+  local gf_url="http://localhost:${gf_port}"
+
+  local sub="${1:-open}"
+  shift 2>/dev/null || true
+
+  case "$sub" in
+    open)
+      info "opening Grafana..."
+      open "$gf_url" 2>/dev/null || echo "$gf_url"
+      ;;
+    status)
+      local stack
+      stack=$(cfg '.observe.stack // "lightweight"')
+      echo "observe stack: $stack"
+      echo "ports: grafana=${gf_port} vm=$(_observe_port victoriametrics 8428) loki=$(_observe_port loki 3100) cadvisor=$(_observe_port cadvisor 8080)"
+      echo ""
+      local containers
+      containers=$(docker ps --filter "label=zlab.component=observability" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null)
+      if [[ -n "$containers" ]]; then
+        echo "$containers"
+      else
+        echo "  no observability containers running"
+      fi
+      echo ""
+      # Grafana health check
+      if curl -sf "${gf_url}/api/health" &>/dev/null; then
+        echo "grafana: healthy (${gf_url})"
+        # Show provisioned datasources
+        local ds
+        ds=$(curl -sf "${gf_url}/api/datasources" 2>/dev/null)
+        if [[ -n "$ds" ]]; then
+          echo "datasources:"
+          echo "$ds" | jq -r '.[] | "  - \(.name) (\(.type))"' 2>/dev/null || true
+        fi
+        # Show dashboards count
+        local db_count
+        db_count=$(curl -sf "${gf_url}/api/search?type=dash-db&tag=zlab" 2>/dev/null | jq 'length' 2>/dev/null || echo "0")
+        echo "dashboards: $db_count zlab dashboards"
+      else
+        echo "grafana: not reachable"
+      fi
+      ;;
+    restart)
+      info "restarting observability stack..."
+      observe_down
+      observe_up
+      ;;
+    dashboards)
+      # List available dashboards with URLs
+      if curl -sf "${gf_url}/api/health" &>/dev/null; then
+        echo "zlab dashboards:"
+        curl -sf "${gf_url}/api/search?type=dash-db&tag=zlab" 2>/dev/null \
+          | jq -r ".[] | \"  \\(.title)  →  ${gf_url}\\(.url)\"" 2>/dev/null \
+          || echo "  no zlab dashboards found"
+      else
+        echo "grafana not running — start with 'zlab up' first"
+      fi
+      ;;
+    *)
+      die "unknown observe subcommand: $sub (use: open, status, restart, dashboards)"
+      ;;
+  esac
+}
+
+cmd_net() {
+  local sub="${1:-topology}"
+  shift 2>/dev/null || true
+
+  case "$sub" in
+    topology|topo|show)
+      network_topology
+      ;;
+    shape|shaping)
+      load_config
+      local action="${1:-status}"
+      case "$action" in
+        on|apply)
+          _network_apply_shaping
+          ;;
+        off|remove)
+          info "removing traffic shaping..."
+          _network_remove_shaping
+          info "shaping removed"
+          ;;
+        status)
+          local net_name
+          net_name=$(cfg '.network.name // ""')
+          if [[ -z "$net_name" || "$net_name" == "null" ]]; then
+            echo "no network configured"
+            return
+          fi
+          echo "traffic shaping status:"
+          local containers
+          containers=$(docker network inspect "$net_name" --format '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null)
+          for c in $containers; do
+            # Skip observe/dns containers
+            [[ "$c" == zlab-dns-* || "$c" == zlab-vm || "$c" == zlab-grafana || "$c" == zlab-loki || "$c" == zlab-cadvisor || "$c" == zlab-otel ]] && continue
+            local qdisc
+            qdisc=""
+            if docker exec "$c" tc qdisc show dev eth0 &>/dev/null; then
+              qdisc=$(docker exec "$c" tc qdisc show dev eth0 2>/dev/null)
+            else
+              qdisc=$(docker run --rm --net=container:"$c" alpine sh -c "apk add -q iproute2 2>/dev/null; tc qdisc show dev eth0" 2>/dev/null || true)
+            fi
+            qdisc=$(echo "$qdisc" | grep -v "^qdisc pfifo_fast\|^qdisc noqueue\|^qdisc fq_codel" || true)
+            if [[ -n "$qdisc" ]]; then
+              echo "  $c: $qdisc"
+            else
+              echo "  $c: no shaping"
+            fi
+          done
+          ;;
+        *)
+          die "usage: zlab net shaping [on|off|status]"
+          ;;
+      esac
+      ;;
+    *)
+      die "unknown net subcommand: $sub (use: topology, shaping)"
+      ;;
+  esac
+}
+
+cmd_logs() {
+  local target="${1:-}"
+  [[ -n "$target" ]] || die "usage: zlab logs <asset-name>"
+  load_config
+
+  local count
+  count=$(asset_count)
+  local i
+  for (( i=0; i<count; i++ )); do
+    local name
+    name=$(asset "$i" "name")
+    if [[ "$name" == "$target" ]]; then
+      local type
+      type=$(asset "$i" "type")
+      case "$type" in
+        kind)
+          kubectl --context "kind-${name}" logs --all-containers=true -l app --tail=50 -f 2>/dev/null \
+            || kubectl --context "kind-${name}" get events --sort-by=.lastTimestamp
+          ;;
+        docker-compose)
+          local compose_file
+          compose_file=$(asset "$i" "config.compose_file")
+          local base_dir
+          base_dir=$(dirname "$ZLAB_CONFIG")
+          docker compose -f "$base_dir/$compose_file" -p "zlab-${ZLAB_PROJECT}-${name}" logs -f --tail=50
+          ;;
+        vm)
+          lima_logs "$i"
+          ;;
+        *) die "logs not supported for asset type: $type" ;;
+      esac
+      return 0
+    fi
+  done
+  die "asset '$target' not found"
+}
+
+cmd_doctor() {
+  echo "zlab doctor v${ZLAB_VERSION}"
+  echo ""
+
+  local tools=("docker" "kind" "kubectl" "limactl" "yq" "jq")
+  local all_ok=true
+
+  for tool in "${tools[@]}"; do
+    if command -v "$tool" &>/dev/null; then
+      local ver
+      ver=$("$tool" version --short 2>/dev/null || "$tool" --version 2>/dev/null | head -1 || echo "ok")
+      printf "  %-12s ✓ %s\n" "$tool" "$ver"
+    else
+      printf "  %-12s ✗ not found\n" "$tool"
+      all_ok=false
+    fi
+  done
+
+  echo ""
+  if docker info &>/dev/null; then
+    echo "  docker daemon: running"
+  else
+    echo "  docker daemon: not running"
+    all_ok=false
+  fi
+
+  echo ""
+  if $all_ok; then
+    echo "all checks passed"
+  else
+    echo "some checks failed — install missing tools"
+  fi
+}
+
+cmd_destroy() {
+  load_config
+  warn "this will destroy ALL resources for '$ZLAB_PROJECT'"
+  read -rp "continue? [y/N] " confirm
+  if [[ "$confirm" =~ ^[Yy]$ ]]; then
+    # Observability
+    observe_down
+
+    # Destroy assets (VMs get fully deleted, not just stopped)
+    local count
+    count=$(asset_count)
+    local i
+    for (( i=count-1; i>=0; i-- )); do
+      local type
+      type=$(asset "$i" "type")
+      case "$type" in
+        kind)           kind_down "$i" ;;
+        docker-compose) compose_down "$i" ;;
+        vm)             lima_destroy "$i" ;;
+      esac
+    done
+
+    # Network
+    network_down
+
+    # Clean state
+    rm -rf "$ZLAB_STATE_DIR"
+
+    info "project '$ZLAB_PROJECT' destroyed"
+  fi
+}
+
+cmd_config() {
+  local action="${1:-show}"
+  case "$action" in
+    show)
+      if [[ -f "$ZLAB_GLOBAL_CONFIG" ]]; then
+        echo "# global config: $ZLAB_GLOBAL_CONFIG"
+        echo ""
+        cat "$ZLAB_GLOBAL_CONFIG"
+      else
+        info "no global config found — run 'zlab config init' to create one"
+      fi
+      ;;
+    edit)
+      local editor="${EDITOR:-vi}"
+      if [[ ! -f "$ZLAB_GLOBAL_CONFIG" ]]; then
+        _config_create_default
+      fi
+      "$editor" "$ZLAB_GLOBAL_CONFIG"
+      ;;
+    init)
+      if [[ -f "$ZLAB_GLOBAL_CONFIG" ]]; then
+        warn "global config already exists at $ZLAB_GLOBAL_CONFIG"
+        return 1
+      fi
+      _config_create_default
+      info "created global config at $ZLAB_GLOBAL_CONFIG"
+      ;;
+    path)
+      echo "$ZLAB_GLOBAL_CONFIG"
+      ;;
+    *)
+      die "usage: zlab config {show|edit|init|path}"
+      ;;
+  esac
+}
+
+_config_create_default() {
+  mkdir -p "$ZLAB_CONFIG_DIR"
+  cat > "$ZLAB_GLOBAL_CONFIG" <<'CFGEOF'
+# zlab global config — your personal defaults
+defaults:
+  tenant: work
+  vm:
+    image: "ubuntu:24.04"
+    cpus: 2
+    memory: "2GiB"
+    disk: "10GiB"
+    vm_type: "qemu"
+    rosetta: true
+    containerd: true
+  kind:
+    k8s_version: "1.30"
+    nodes: 1
+    cni: "default"
+  network:
+    subnet_base: "172.30"
+    dns: false
+  observe:
+    enabled: false
+    stack: "lightweight"
+CFGEOF
+}
+
+cmd_images() {
+  echo "available VM images:"
+  echo ""
+  echo "  ubuntu:24.04    Ubuntu 24.04 Noble (default)"
+  echo "  ubuntu:22.04    Ubuntu 22.04 Jammy"
+  echo "  ubuntu:20.04    Ubuntu 20.04 Focal"
+  echo "  debian:12       Debian 12 Bookworm"
+  echo "  debian:11       Debian 11 Bullseye"
+  echo "  fedora:41       Fedora 41"
+  echo "  fedora:40       Fedora 40"
+  echo "  alpine:3.21     Alpine 3.21"
+  echo "  alpine:3.20     Alpine 3.20"
+  echo "  archlinux       Arch Linux (latest)"
+  echo "  rocky:9         Rocky Linux 9"
+  echo "  opensuse:tumbleweed  openSUSE Tumbleweed"
+  echo ""
+  echo "  https://...     direct URL to cloud image"
+  echo "  /path/to/img    local disk image"
+}
+
+cmd_help() {
+  cat <<EOF
+zlab v${ZLAB_VERSION} — local infrastructure lab manager
+
+usage: zlab <command> [args]
+
+commands:
+  init [template]    scaffold .zlab.yaml (templates: basic, kind-fury, trading,
+                     fullstack, vm-linux, multi-tenant, network-lab)
+  up                 bring up all project resources
+  down               tear down all project resources (VMs stopped, not deleted)
+  status             show resource status
+  ssh <asset>        enter an asset (vm shell / k8s debug / compose list)
+  logs <asset>       tail logs from an asset
+  net [action]       network (topology|shaping [on|off|status])
+  observe [action]   observability (open|status|restart|dashboards)
+  config [action]    manage global defaults (show|edit|init|path)
+  images             list available VM images
+  doctor             check prerequisites
+  destroy            full cleanup with confirmation (VMs deleted)
+
+asset types:
+  kind               local Kubernetes cluster (via kind)
+  docker-compose     docker compose stack
+  vm                 Linux VM (via Lima/QEMU)
+
+kind config:
+  cni                default, cilium, calico, flannel
+  addons             metrics-server, ingress-nginx, local-registry, cert-manager
+  feature_gates      K8s feature gates [{name: X, enabled: true}]
+  pod_subnet         custom pod CIDR
+  service_subnet     custom service CIDR
+
+vm config:
+  image              see 'zlab images' for full list
+  vm_type            qemu (default) or vz (macOS Virtualization.framework)
+  rosetta            x86 emulation on Apple Silicon (default: true)
+  containerd         container runtime inside VM (default: true)
+  mounts             additional host→guest mounts [{location, writable}]
+  dns                custom DNS servers [ip, ip, ...]
+  env                environment variables [{KEY: val}]
+  provision          [{mode: system, script: path}] or [{mode: user, inline: "..."}]
+
+network config:
+  driver             bridge (default), macvlan, ipvlan
+  driver_opts        {parent: en0, mode: bridge|vepa|l2|l3}
+  mtu                custom MTU (e.g. 9000 for jumbo frames)
+  gateway            gateway IP (macvlan/ipvlan)
+  ip_range           allocatable IP range (macvlan/ipvlan)
+  ipv6               {enabled: true, subnet: "fd00:zlab::/64"}
+  dns                enable DNS service (default: false)
+  dns_engine         dnsmasq (lightweight) or bind (ISC BIND9, full-featured)
+  dns_domain         custom domain (default: zlab.local)
+  dns_forwarders     upstream DNS servers [ip, ip, ...]
+  dns_records        static A/CNAME records [{name, type, value}]
+  dns_zones          custom BIND zone files [{name, file}]
+  dnssec             enable DNSSEC validation (bind only)
+  peers              cross-project network peering
+  shaping            traffic control (tc/netem):
+    latency          e.g. "50ms"
+    jitter           e.g. "10ms"
+    loss             e.g. "1%"
+    bandwidth        e.g. "100mbit"
+    targets          [asset-name, ...] (default: all)
+
+global config:
+  ~/.config/infra-lab/config.yaml — default values for all projects
+  run 'zlab config edit' to customize
+
+options:
+  --project <path>   use .zlab.yaml from specific path
+  -h, --help         show this help
+  -v, --version      show version
+EOF
+}
+
+# --- Main ---
+
+main() {
+  # Parse global flags
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --project)
+        ZLAB_PROJECT_PATH="$2"
+        shift 2
+        ;;
+      -v|--version)
+        echo "zlab v${ZLAB_VERSION}"
+        exit 0
+        ;;
+      -h|--help)
+        cmd_help
+        exit 0
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+
+  local cmd="${1:-help}"
+  shift || true
+
+  case "$cmd" in
+    init)    cmd_init "$@" ;;
+    up)      cmd_up "$@" ;;
+    down)    cmd_down "$@" ;;
+    status)  cmd_status "$@" ;;
+    ssh)     cmd_ssh "$@" ;;
+    logs)    cmd_logs "$@" ;;
+    net)     cmd_net "$@" ;;
+    observe) cmd_observe "$@" ;;
+    config)  cmd_config "$@" ;;
+    images)  cmd_images "$@" ;;
+    doctor)  cmd_doctor "$@" ;;
+    destroy) cmd_destroy "$@" ;;
+    help)    cmd_help ;;
+    *)       die "unknown command: $cmd (run 'zlab help')" ;;
+  esac
+}
+
+main "$@"

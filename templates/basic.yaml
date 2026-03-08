@@ -1,0 +1,14 @@
+# zlab basic template — single docker-compose service
+# Usage: zlab init --template basic
+
+project: my-project
+tenant: personal
+
+assets:
+  - name: app
+    driver: compose
+    compose_file: docker-compose.yml
+
+network:
+  name: zlab-${project}
+  subnet: "172.30.0.0/24"
