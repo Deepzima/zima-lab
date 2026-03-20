@@ -131,8 +131,12 @@ load_config() {
   mkdir -p "$ZLAB_STATE_DIR"
 }
 
-# Read a field from config
-cfg() { yq "$1" "$ZLAB_CONFIG"; }
+# Read a field from config (interpolates ${project} → ZLAB_PROJECT)
+cfg() {
+  local val
+  val=$(yq "$1" "$ZLAB_CONFIG")
+  echo "${val//\$\{project\}/$ZLAB_PROJECT}"
+}
 
 # Read asset count
 asset_count() { yq '.assets | length' "$ZLAB_CONFIG"; }
@@ -230,21 +234,31 @@ EOF
   local port_count
   port_count=$(asset "$idx" 'config.port_mappings | length // 0')
   if [[ "$port_count" -gt 0 ]]; then
+    # Target node: control-plane is index 0, workers start at 1
+    # worker_port_mapping_index 0 = first worker = nodes[1]
+    local port_node_idx=0
+    local wpm_idx
+    wpm_idx=$(asset "$idx" 'config.worker_port_mapping_index // "null"')
+    if [[ "$wpm_idx" != "null" && -n "$wpm_idx" ]]; then
+      port_node_idx=$(( wpm_idx + 1 ))
+    fi
+
     local tmp
     tmp=$(mktemp)
-    yq eval '
-      .nodes[0].extraPortMappings = []
-    ' "$kind_config" > "$tmp" && mv "$tmp" "$kind_config"
+    yq eval "
+      .nodes[$port_node_idx].extraPortMappings = []
+    " "$kind_config" > "$tmp" && mv "$tmp" "$kind_config"
 
     local p
     for (( p=0; p<port_count; p++ )); do
-      local container_port host_port protocol
+      local container_port host_port protocol listen_addr
       container_port=$(asset "$idx" "config.port_mappings[$p].container")
       host_port=$(asset "$idx" "config.port_mappings[$p].host")
       protocol=$(asset "$idx" "config.port_mappings[$p].protocol // \"TCP\"")
+      listen_addr=$(asset "$idx" "config.port_mappings[$p].listen // \"0.0.0.0\"")
       tmp=$(mktemp)
       yq eval "
-        .nodes[0].extraPortMappings += [{\"containerPort\": $container_port, \"hostPort\": $host_port, \"protocol\": \"$protocol\"}]
+        .nodes[$port_node_idx].extraPortMappings += [{\"containerPort\": $container_port, \"hostPort\": $host_port, \"protocol\": \"$protocol\", \"listenAddress\": \"$listen_addr\"}]
       " "$kind_config" > "$tmp" && mv "$tmp" "$kind_config"
     done
   fi
