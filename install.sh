@@ -3,7 +3,7 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_DIR="${ZLAB_CONFIG_DIR:-$HOME/.config/zlab}"
-BIN_DIR="${ZLAB_BIN_DIR:-$HOME/.local/bin}"
+BIN_DIR="${ZLAB_BIN_DIR:-$HOME/bin}"
 
 echo "zlab installer"
 echo ""
