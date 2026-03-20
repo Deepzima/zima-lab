@@ -147,10 +147,11 @@ kind_up() {
   local name
   name=$(asset "$idx" "name")
 
-  local nodes k8s_version cni
+  local nodes k8s_version cni image
   nodes=$(asset_default "$idx" "config.nodes" ".defaults.kind.nodes" "1")
   k8s_version=$(asset_default "$idx" "config.k8s_version" ".defaults.kind.k8s_version" "1.30")
   cni=$(asset_default "$idx" "config.cni" ".defaults.kind.cni" "default")
+  image=$(asset_default "$idx" "config.image" ".defaults.kind.image" "kindest/node:v${k8s_version}")
 
   if kind get clusters 2>/dev/null | grep -q "^${name}$"; then
     info "kind cluster '$name' already running"
@@ -250,7 +251,7 @@ EOF
 
   kind create cluster \
     --name "$name" \
-    --image "kindest/node:v${k8s_version}" \
+    --image "$image" \
     --config "$kind_config" \
     --wait 60s
 
